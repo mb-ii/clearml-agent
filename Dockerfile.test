@@ -6,3 +6,4 @@ COPY ./clearml_agent/glue/k8s.py /usr/local/lib/python3.6/dist-packages/clearml_
 COPY ./clearml_agent/glue/definitions.py /usr/local/lib/python3.6/dist-packages/clearml_agent/glue/definitions.py
 COPY ./clearml_agent/helper/docker_args.py /usr/local/lib/python3.6/dist-packages/clearml_agent/helper/docker_args.py
 COPY ./clearml_agent/helper/resource_monitor.py /usr/local/lib/python3.6/dist-packages/clearml_agent/helper/resource_monitor.py
+COPY ./clearml_agent/helper/custom_template.py /usr/local/lib/python3.6/dist-packages/clearml_agent/helper/custom_template.py
