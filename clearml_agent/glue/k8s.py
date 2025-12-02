@@ -466,25 +466,36 @@ class K8sIntegration(Worker):
         return str(ENV_DOCKER_IMAGE.get() or session.config.get("agent.default_docker.image", "nvidia/cuda"))
 
     def run_one_task(self, queue: Text, task_id: Text, worker_args=None, task_session=None, **_):
+        print('[DEBUG] run_one_task: START - task_id={}, queue={}'.format(task_id, queue))
         print('Pulling task {} launching on kubernetes cluster'.format(task_id))
         session = task_session or self._session
+        print('[DEBUG] run_one_task: Fetching task data for task_id={}'.format(task_id))
         task_data = self._session.get(service="tasks", action="get_all", version="2.13", id=[task_id])['tasks'][0]
+        print('[DEBUG] run_one_task: Got task data, status={}'.format(task_data.get('status', 'unknown')))
 
         # push task into the k8s queue, so we have visibility on pending tasks in the k8s scheduler
+        print('[DEBUG] run_one_task: Checking if same tenant, task_session={}'.format(task_session is not None))
         if self._is_same_tenant(task_session):
             try:
+                print('[DEBUG] run_one_task: Same tenant, pushing task {} into temporary pending queue {} (id={})'.format(
+                    task_id, self.k8s_pending_queue_name, self.k8s_pending_queue_id))
                 print('Pushing task {} into temporary pending queue'.format(task_id))
 
                 if not self._server_supports_same_state_transition:
+                    print('[DEBUG] run_one_task: Server does not support same state transition, stopping task first')
                     _ = session.api_client.tasks.stop(task_id, force=True, status_reason="moving to k8s pending queue")
+                    print('[DEBUG] run_one_task: Task stopped successfully')
 
                 # Just make sure to clean up in case the task is stuck in the queue (known issue)
+                print('[DEBUG] run_one_task: Removing task from pending queue (cleanup)')
                 self._session.api_client.queues.remove_task(
                     task=task_id,
                     queue=self.k8s_pending_queue_id,
                 )
 
                 for attempt in range(2):
+                    print('[DEBUG] run_one_task: Enqueue attempt {} for task {} to queue {}'.format(
+                        attempt + 1, task_id, self.k8s_pending_queue_id))
                     res = self._session.send_request(
                         "tasks",
                         "enqueue",
@@ -494,32 +505,48 @@ class K8sIntegration(Worker):
                             "status_reason": "k8s pending scheduler",
                         }
                     )
+                    print('[DEBUG] run_one_task: Enqueue response status={}, ok={}'.format(
+                        res.status_code if hasattr(res, 'status_code') else 'N/A', res.ok))
                     if res.ok:
+                        print('[DEBUG] run_one_task: Successfully enqueued task {} to pending queue'.format(task_id))
                         break
 
                     # noinspection PyBroadException
                     try:
                         result_subcode = res.json()["meta"]["result_subcode"]
                         result_msg = res.json()["meta"]["result_msg"]
+                        print('[DEBUG] run_one_task: Enqueue failed, subcode={}, msg={}'.format(
+                            result_subcode, result_msg))
                     except Exception:
                         result_subcode = None
                         result_msg = res.text
+                        print('[DEBUG] run_one_task: Enqueue failed, could not parse response: {}'.format(result_msg))
 
                     if attempt == 0 and res.status_code == 400 and result_subcode == 701:
                         # Invalid queue ID, only retry once
+                        print('[DEBUG] run_one_task: Invalid queue ID, ensuring pending queue exists')
                         self._ensure_pending_queue_exists()
                         continue
                     raise Exception(result_msg)
 
             except Exception as e:
+                print('[DEBUG] run_one_task: ERROR pushing to pending queue: {}'.format(e))
                 self.log.error("ERROR: Could not push back task [{}] to k8s pending queue {} [{}], error: {}".format(
                     task_id, self.k8s_pending_queue_name, self.k8s_pending_queue_id, e))
                 return
+        else:
+            print('[DEBUG] run_one_task: Different tenant, skipping pending queue push')
 
+        print('[DEBUG] run_one_task: Getting container configuration for task {}'.format(task_id))
         container = get_task_container(session, task_id)
+        print('[DEBUG] run_one_task: Container config: image={}, has_args={}'.format(
+            container.get('image'), bool(container.get('arguments'))))
         if not container.get('image'):
+            print('[DEBUG] run_one_task: No container image, using default: {}'.format(
+                self.get_default_docker_image(session, queue)))
             container['image'] = self.get_default_docker_image(session, queue)
             container['arguments'] = session.config.get("agent.default_docker.arguments", None)
+            print('[DEBUG] run_one_task: Setting task container with image={}'.format(container['image']))
             set_task_container(
                 session, task_id, docker_image=container['image'], docker_arguments=container['arguments']
             )
@@ -632,22 +659,30 @@ class K8sIntegration(Worker):
         else:
             print("Kubernetes scheduling task id={}".format(task_id))
 
+        print('[DEBUG] run_one_task: Resolving template for task {}'.format(task_id))
         try:
             template = self._resolve_template(task_session, task_data, queue, task_id)
+            print('[DEBUG] run_one_task: Template resolved, has_template={}'.format(template is not None))
         except Exception as ex:
+            print('[DEBUG] run_one_task: ERROR resolving template: {}'.format(ex))
             print("ERROR: Failed resolving template (skipping): {}".format(ex))
             return
 
         try:
             namespace = template['metadata']['namespace'] or self.namespace
+            print('[DEBUG] run_one_task: Using namespace={}'.format(namespace))
         except (KeyError, TypeError, AttributeError):
             namespace = self.namespace
+            print('[DEBUG] run_one_task: Exception getting namespace from template, using default={}'.format(namespace))
 
         if not template:
+            print('[DEBUG] run_one_task: ERROR - no template for task {}'.format(task_id))
             print("ERROR: no template for task {}, skipping".format(task_id))
             return
 
         pod_name = self.pod_name_prefix + str(task_id)
+        print('[DEBUG] run_one_task: Pod name will be: {}'.format(pod_name))
+        print('[DEBUG] run_one_task: Calling apply_template_and_handle_result for task {}'.format(task_id))
 
         self.apply_template_and_handle_result(
             pod_name=pod_name,
@@ -668,6 +703,7 @@ class K8sIntegration(Worker):
             ports_mode=ports_mode,
             pod_count=pod_count,
         )
+        print('[DEBUG] run_one_task: END - task_id={}, completed apply_template_and_handle_result'.format(task_id))
 
     def apply_template_and_handle_result(
             self,
@@ -691,7 +727,11 @@ class K8sIntegration(Worker):
             base_spec: dict = None,
     ):
         """Apply the provided template with all custom settings and handle bookkeeping for the reaults"""
+        print('[DEBUG] apply_template_and_handle_result: START - task_id={}, pod_name={}, namespace={}'.format(
+            task_id, pod_name, namespace))
+        print('[DEBUG] apply_template_and_handle_result: docker_image={}, labels={}'.format(docker_image, labels))
 
+        print('[DEBUG] apply_template_and_handle_result: Calling _kubectl_apply for task {}'.format(task_id))
         output, error, pod_name = self._kubectl_apply(
             pod_name=pod_name,
             template=template,
@@ -708,38 +748,54 @@ class K8sIntegration(Worker):
             base_spec=base_spec,
         )
 
+        print('[DEBUG] apply_template_and_handle_result: kubectl_apply returned - output_len={}, error_len={}, pod_name={}'.format(
+            len(output) if output else 0, len(error) if error else 0, pod_name))
         print('kubectl output:\n{}\n{}'.format(error, output))
         if error:
+            print('[DEBUG] apply_template_and_handle_result: kubectl returned error for task {}'.format(task_id))
             if self.ignore_kubectl_errors_re and self.ignore_kubectl_errors_re.match(error):
+                print('[DEBUG] apply_template_and_handle_result: Ignoring error due to ignore pattern')
                 print(f"Ignoring error due to {ENV_KUBECTL_IGNORE_ERROR.key}")
             else:
+                print('[DEBUG] apply_template_and_handle_result: Setting task as failed due to kubectl error')
                 self._set_task_failed_while_applying(
                     session, task_id, f"Running kubectl encountered an error: {error}"
                 )
                 return
+        else:
+            print('[DEBUG] apply_template_and_handle_result: kubectl apply succeeded for task {}'.format(task_id))
 
         if pod_name:
+            print('[DEBUG] apply_template_and_handle_result: Calling resource_applied for pod_name={}'.format(pod_name))
             self.resource_applied(
                 resource_name=pod_name, namespace=namespace, task_id=task_id, session=session
             )
 
+        print('[DEBUG] apply_template_and_handle_result: Setting task info for task {}'.format(task_id))
         self.set_task_info(
             task_id=task_id, task_session=task_session, queue_name=queue_name, ports_mode=ports_mode,
             pod_number=pod_number, pod_count=pod_count, task_data=task_data
         )
+        print('[DEBUG] apply_template_and_handle_result: END - task_id={}'.format(task_id))
 
     def _set_task_failed_while_applying(self, session, task_id: str, error: str):
+        print('[DEBUG] _set_task_failed_while_applying: START - task_id={}, error={}'.format(task_id, error))
         send_log = "Running kubectl encountered an error: {}".format(error)
         self.log.error(send_log)
+        print('[DEBUG] _set_task_failed_while_applying: Sending logs to task')
         self.send_logs(task_id, send_log.splitlines())
 
         # Make sure to remove the task from our k8s pending queue
+        print('[DEBUG] _set_task_failed_while_applying: Removing task from pending queue {}'.format(
+            self.k8s_pending_queue_id))
         self._session.api_client.queues.remove_task(
             task=task_id,
             queue=self.k8s_pending_queue_id,
         )
         # Set task as failed
+        print('[DEBUG] _set_task_failed_while_applying: Setting task as failed')
         session.api_client.tasks.failed(task_id, force=True)
+        print('[DEBUG] _set_task_failed_while_applying: END - task_id={} marked as failed'.format(task_id))
 
     def set_task_info(
             self, task_id: str, task_session, task_data, queue_name: str, ports_mode: bool, pod_number, pod_count
@@ -1019,15 +1075,24 @@ class K8sIntegration(Worker):
 
         # add the template file at the end
         kubectl_cmd += [yaml_file]
+        print('[DEBUG] _kubectl_apply: Executing kubectl command: {}'.format(' '.join(kubectl_cmd)))
+        print('[DEBUG] _kubectl_apply: task_id={}, namespace={}, pod_name={}'.format(task_id, namespace, pod_name))
         try:
             process = subprocess.Popen(kubectl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print('[DEBUG] _kubectl_apply: kubectl process started, waiting for completion')
             output, error = process.communicate()
+            print('[DEBUG] _kubectl_apply: kubectl process completed, returncode={}'.format(process.returncode))
         except Exception as ex:
+            print('[DEBUG] _kubectl_apply: ERROR executing kubectl: {}'.format(ex))
             return None, str(ex), None
         finally:
             safe_remove_file(yaml_file)
 
-        return stringify_bash_output(output), stringify_bash_output(error), pod_name
+        output_str = stringify_bash_output(output)
+        error_str = stringify_bash_output(error)
+        print('[DEBUG] _kubectl_apply: Returning - output_len={}, error_len={}'.format(
+            len(output_str), len(error_str)))
+        return output_str, error_str, pod_name
 
     def _process_bash_lines_response(self, bash_cmd: str, raise_error=True):
         res = get_bash_output(bash_cmd, raise_error=raise_error)
@@ -1288,15 +1353,20 @@ class K8sIntegration(Worker):
             self._ensure_pending_queue_exists()
 
         _last_machine_update_ts = 0
+        print('[DEBUG] run_tasks_loop: Starting main loop, queues={}'.format(queues))
         while True:
             # Get used pods and namespaces
+            print('[DEBUG] run_tasks_loop: Getting used pods count')
             current_pods, namespaces = self._get_used_pods()
+            print('[DEBUG] run_tasks_loop: Current pods={}, namespaces={}'.format(current_pods, namespaces))
 
             # just in case there are no pods, make sure we look at our base namespace
             namespaces.add(self.namespace)
 
             # check if have pod limit, then check if we hit it.
             if self.max_pods_limit:
+                print('[DEBUG] run_tasks_loop: Checking pod limit: current={}, max={}'.format(
+                    current_pods, self.max_pods_limit))
                 if current_pods >= self.max_pods_limit:
                     print("Maximum {} limit reached {}/{}, sleeping for {:.1f} seconds".format(
                         self.kind, current_pods, self.max_pods_limit, self._polling_interval))
@@ -1307,8 +1377,10 @@ class K8sIntegration(Worker):
                     continue
 
             # iterate over queues (priority style, queues[0] is highest)
+            print('[DEBUG] run_tasks_loop: Iterating over {} queues'.format(len(queues)))
             # print("debug> iterating over queues")
             for queue in queues:
+                print('[DEBUG] run_tasks_loop: Processing queue: {}'.format(queue))
                 # delete old completed / failed pods
                 self._cleanup_old_pods(namespaces, extra_msg="Cleanup cycle {cmd}")
 
@@ -1322,20 +1394,29 @@ class K8sIntegration(Worker):
 
                 # get next task in queue
                 try:
+                    print('[DEBUG] run_tasks_loop: Getting next task from queue {}'.format(queue))
                     # print(f"debug> getting tasks for queue {queue}")
                     response = self._get_next_task(queue=queue, get_task_info=self._impersonate_as_task_owner)
+                    print('[DEBUG] run_tasks_loop: Got response from _get_next_task, has_response={}'.format(
+                        response is not None))
                 except Exception as e:
+                    print('[DEBUG] run_tasks_loop: ERROR getting next task from queue {}: {}'.format(queue, e))
                     print("Warning: Could not access task queue [{}], error: {}".format(queue, e))
                     continue
                 else:
                     if not response:
+                        print('[DEBUG] run_tasks_loop: No response from _get_next_task for queue {}'.format(queue))
                         continue
                     try:
                         task_id = response["entry"]["task"]
-                    except (KeyError, TypeError, AttributeError):
+                        print('[DEBUG] run_tasks_loop: Extracted task_id={} from response'.format(task_id))
+                    except (KeyError, TypeError, AttributeError) as ex:
+                        print('[DEBUG] run_tasks_loop: ERROR extracting task_id from response: {}'.format(ex))
                         print("No tasks in queue {}".format(queue))
                         continue
 
+                    print('[DEBUG] run_tasks_loop: About to call run_one_task for task_id={}, queue={}'.format(
+                        task_id, queue))
                     print('Received task {} from queue {}'.format(task_id, queue))
 
                     task_session = None
@@ -1367,11 +1448,15 @@ class K8sIntegration(Worker):
                     )
 
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues, queue=queue, task=task_id))
+                    print('[DEBUG] run_tasks_loop: Calling run_one_task for task_id={}'.format(task_id))
                     self.run_one_task(queue, task_id, worker_params, task_session)
+                    print('[DEBUG] run_tasks_loop: Completed run_one_task for task_id={}'.format(task_id))
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
                     break
             else:
                 # sleep and retry polling
+                print('[DEBUG] run_tasks_loop: No tasks found in any queue, sleeping for {:.1f} seconds'.format(
+                    self._polling_interval))
                 print("No tasks in Queues, sleeping for {:.1f} seconds".format(self._polling_interval))
                 sleep(self._polling_interval)
 
